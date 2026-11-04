@@ -1,0 +1,6 @@
+# Tested with these on Windows 11, Python 3.12 (Nov 2026)
+PySide6-Essentials>=6.8   # the window: Qt Widgets only, no web engine (LGPL)
+numpy>=1.26               # the maths
+av>=14                    # PyAV: reads short clips' sound without starting FFmpeg (BSD; FFmpeg inside)
+# Also needed: the FFmpeg program for long files (winget install ffmpeg / brew install ffmpeg,
+# or ffmpeg.exe in Tools\ffmpeg), and DaVinci Resolve Studio with external scripting set to Local.

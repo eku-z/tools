@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+# an FFmpeg program kept next to the code (large; get it with winget or brew)
+ffmpeg/
