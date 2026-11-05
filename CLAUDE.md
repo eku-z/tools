@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 Tools is a light, fast PySide6 (Qt Widgets) helper for DaVinci Resolve
-Studio, grown from ZCuts: cut silences, A/B camera cut, music montage,
-9:16 copy, LUT + sideways clips upright. Read `README.md` first (what it
+Studio, grown from ZCuts: cut silences, A/B camera cut, cut to the beat
+(or a set tempo), 9:16, Look (LUT, upright, fill the frame), all on the
+open timeline. Every switch starts off (the owner's choice). Read `README.md` first (what it
 does, measured speed, what is not checked in real Resolve), then
 `CHANGELOG.md`.
 
@@ -12,9 +13,11 @@ does, measured speed, what is not checked in real Resolve), then
   (`C:\Users\samue\Desktop\Edits`). Read them and port code into Tools with
   a source reference in the docstring ("ported from ZCuts
   (engine/NN_file.py function; build N)"); never import from them.
-- **Never change the person's timelines.** Every job builds a new timeline
-  (or a `DuplicateTimeline` copy), recorded in an `UndoRecord` the moment
-  it exists (`jobs.Build`), so Undo is deleting what a job made.
+- **Jobs change the open timeline, and only after a backup.**
+  `jobs.Session.before_change` copies it into the "Tools backups" bin before
+  the first change (no copy, no change); Undo puts the copy back
+  (`undo.History.undo`). Cutting is `timeline.put_back`: take clips off, put
+  pieces back at exact frames with each clip's settings and grade.
 - **Resolve is only called on the window's thread.** A job is a generator
   (`tools/core/work.py`): it calls Resolve itself and `yield`s a `Heavy`
   for slow pure work (reading sound, finding beats), which runs on a
@@ -37,6 +40,8 @@ does, measured speed, what is not checked in real Resolve), then
 ```
 py -3.12 -m tools                      # run (or Run Tools.bat)
 py -3.12 -m tools --startup-time       # how long the window takes to appear
+py -3.12 -m tools --check              # what Tools finds (packages, FFmpeg, Resolve, LUTs)
+bash setup_mac.sh                      # a Mac: .venv, packages, check; then Run Tools.command
 py -3.12 tests/run_tests.py            # all tests
 py -3.12 tests/run_tests.py -k word    # filter
 ```

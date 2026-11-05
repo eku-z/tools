@@ -8,6 +8,9 @@
   first beat of each bar.
 - canon_side.mp4: a small video with a Canon MakerNote saying the camera
   was on its side (AutoRotate 3: turn 270 degrees clockwise).
+- phone_portrait.mp4: stored 320x180 with a display matrix turning it a
+  quarter, as phones write a clip filmed upright: shown 180x320.
+- four_three.mp4: 240x180, a 4:3 picture.
 
 Made once per test run in a scratch folder (tests/run_tests.py sets
 TOOLS_TEST_MEDIA); all sound is synthetic.
@@ -98,6 +101,22 @@ def canon_makernote(auto_rotate: int = 3) -> bytes:
     values[27] = auto_rotate
     out += struct.pack("<34h", *values)
     return b"Exif\x00\x00" + bytes(out)
+
+
+def phone_portrait() -> str:
+    path = os.path.join(folder(), "phone_portrait.mp4")
+    if not os.path.isfile(path):
+        plain = os.path.join(folder(), "phone_plain.mp4")
+        _ffmpeg(*_video(2, "320x180"), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", plain)
+        _ffmpeg("-display_rotation", "90", "-i", plain, "-c", "copy", path)
+    return path
+
+
+def four_three() -> str:
+    path = os.path.join(folder(), "four_three.mp4")
+    if not os.path.isfile(path):
+        _ffmpeg(*_video(2, "240x180"), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", path)
+    return path
 
 
 def canon_side() -> str:

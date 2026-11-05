@@ -122,8 +122,67 @@ class Probe:
 
 
 _DURATION = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
-_VIDEO_SIZE = re.compile(r"Stream #\d+:\d+.*?: Video:.*?(\d{2,5})x(\d{2,5})")
+_VIDEO_SIZE = re.compile(r"Stream #\d+:\d+.*?: Video:.*?(\d{2,5})x(\d{2,5})(?:.*?\[SAR (\d+):(\d+))?")
+_ROTATION = re.compile(r"rotation of (-?\d+(?:\.\d+)?) degrees")
 _probes: dict = {}
+_shown: dict = {}
+
+
+def _key(path: str):
+    st = os.stat(path)
+    return os.path.normcase(os.path.abspath(path)), st.st_size, st.st_mtime
+
+
+def _shown_av(av, path: str):
+    with av.open(path) as container:
+        if not container.streams.video:
+            return None
+        s = container.streams.video[0]
+        width, height = float(s.codec_context.width or 0), float(s.codec_context.height or 0)
+        sar = s.codec_context.sample_aspect_ratio or s.sample_aspect_ratio
+        rotation = 0
+        try:  # phones write the turn into the file; PyAV gives it on a frame
+            rotation = int(getattr(next(container.decode(s)), "rotation", 0) or 0)
+        except (StopIteration, av.error.FFmpegError):
+            pass
+    return width * float(sar) if sar else width, height, rotation
+
+
+def _shown_cli(path: str):
+    done = subprocess.run([_ffmpeg(), "-hide_banner", "-nostdin", "-i", path], stdin=subprocess.DEVNULL,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60, creationflags=helper_flags())
+    text = done.stderr.decode("utf-8", "replace")
+    m = _VIDEO_SIZE.search(text)
+    if not m:
+        return None
+    width, height = float(m.group(1)), float(m.group(2))
+    if m.group(3) and float(m.group(4)) > 0:
+        width *= float(m.group(3)) / float(m.group(4))
+    r = _ROTATION.search(text)
+    return width, height, int(round(float(r.group(1)))) if r else 0
+
+
+def shown_size(path: str) -> Optional[tuple[float, float]]:
+    """A file's picture size as it is shown: wider for anamorphic pixels,
+    and the other way round when the file says to show it turned a quarter
+    (phones), which Resolve does by itself. None for no picture. Read from
+    the file, not Resolve's "Resolution" (that may be the stored size)."""
+    try:
+        key = _key(path)
+    except OSError:
+        return None
+    if key not in _shown:
+        av = pyav()
+        try:
+            found = _shown_av(av, path) if av is not None else _shown_cli(path)
+        except Exception:  # noqa: BLE001 - unreadable: Resolve's own size is used instead
+            found = None
+        if found is not None and found[0] > 0 and found[1] > 0:
+            width, height, rotation = found
+            _shown[key] = (height, width) if rotation % 180 == 90 else (width, height)
+        else:
+            _shown[key] = None
+    return _shown[key]
 
 
 def _probe_av(av, path: str) -> Probe:
@@ -143,7 +202,7 @@ def _probe_cli(path: str) -> Probe:
     found = Probe(audio_streams=len(re.findall(r"Stream #\d+:\d+.*?: Audio", text)))
     m = _VIDEO_SIZE.search(text)
     if m:
-        found.width, found.height = int(m.group(1)), int(m.group(2))
+        found.width, found.height = int(m.group(1)), int(m.group(2))  # as stored
     m = _DURATION.search(text)
     if m:
         found.duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
@@ -154,10 +213,9 @@ def probe(path: str) -> Probe:
     """A file's sound streams, picture size and length; remembered per
     file, size and date."""
     try:
-        st = os.stat(path)
+        key = _key(path)
     except OSError:
         return Probe()
-    key = (os.path.normcase(os.path.abspath(path)), st.st_size, st.st_mtime)
     if key not in _probes:
         av = pyav()
         try:
@@ -290,9 +348,12 @@ def _decode_cli(path: str, start: float, length: Optional[float], stream: int, r
 
 
 def is_short(path: str, start: float, length: Optional[float]) -> bool:
-    """Is this read short enough for PyAV (and is PyAV here)?"""
+    """Is this read short enough for PyAV (and is PyAV here)? Without the
+    FFmpeg program (a Mac often has none) PyAV reads everything."""
     if pyav() is None:
         return False
+    if find_ffmpeg() is None:
+        return True
     if length is None:  # to the end of the file
         duration = probe(path).duration
         length = duration - start if duration > 0 else None

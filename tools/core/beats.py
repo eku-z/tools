@@ -332,6 +332,16 @@ def beat_energy(samples: np.ndarray, times) -> list[float]:
     return [round(float(rank) / max(1, len(levels) - 1), 3) for rank in ranks]
 
 
+def steady(bpm: float, seconds: float) -> dict:
+    """Beats at a set tempo from 0 s, for cutting without a song (the same
+    shape detect returns; every fourth beat starts a bar)."""
+    period = 60.0 / float(bpm)
+    count = int(seconds / period) + 2
+    return {"times": [round(i * period, 4) for i in range(count)], "period": period, "bpm": float(bpm),
+            "bpm_exact": float(bpm), "downbeat": 0, "bar_confidence": 1.0, "steady": True, "energy": [],
+            "typed": float(bpm), "other_tempos": [], "duration": float(seconds)}
+
+
 class NoBeat(ValueError):
     pass
 

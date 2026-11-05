@@ -47,6 +47,28 @@ def test_silence_on_real_sound():
         assert len(cuts) == 1 and abs(cuts[0][0] - 9.12) < 0.04, (engine, cuts)
 
 
+def test_without_the_ffmpeg_program():
+    """A Mac often has no FFmpeg program: PyAV then reads every file."""
+    saved = list(media._found)
+    real = media.find_ffmpeg
+    media.find_ffmpeg = lambda: None
+    try:
+        long = media.read_levels(mf.cameras()[0])  # the whole file, which would go to FFmpeg
+        assert long is not None and abs(long.end - 60.0) < 0.1
+        many = media.read_many([("a", mf.talk(), 0.0, None, 0), ("b", mf.cameras()[1], 0.0, 400.0, 0)])
+        assert all(isinstance(v, Levels) for v in many.values()), many
+    finally:
+        media.find_ffmpeg = real
+        media._found[:] = saved
+
+
+def test_check_report():
+    from tools.app import check
+
+    lines = check.report()
+    assert lines[0].startswith("Tools ") and any("Resolve's scripting library" in line for line in lines)
+
+
 def test_both_decoders_agree():
     path = mf.cameras()[0]
     a = media.read_levels(path, 10.0, 30.0, engine="pyav")
@@ -164,6 +186,26 @@ def test_framing():
     assert upright_wide.rotation == -90.0 and abs(upright_wide.zoom - 1080 / 1920) < 1e-6, upright_wide
     plain = framing.placement((1920, 1080), (1920, 1080), 0, fill=True)
     assert plain.zoom == 1.0 and plain.rotation == 0.0
+    # a half turn needs no more zoom than none; any angle folds the same way
+    assert abs(framing.cover_zoom((1440, 1080), (1920, 1080), 180.0) - framing.cover_zoom((1440, 1080), (1920, 1080))) < 1e-9
+    assert abs(framing.cover_zoom((1920, 1080), (1920, 1080), 100.0) - framing.cover_zoom((1920, 1080), (1920, 1080), 80.0)) < 1e-9
+    # moved 96 px sideways: 96 px more picture each side, none more above and below
+    assert abs(framing.cover_zoom((1920, 1080), (1920, 1080), 0.0, spare=1.0, shift=(-96, 0)) - 2112 / 1920) < 1e-9
+    assert abs(framing.cover_zoom((1920, 1080), (1920, 1080), 0.0, spare=1.0, shift=(0, 54)) - 1188 / 1080) < 1e-9
+
+
+def test_shown_size():
+    for engine in ("pyav", "cli"):
+        if engine == "cli":
+            media._shown.clear()
+            media._av[:] = [None]
+        try:
+            assert media.shown_size(mf.phone_portrait()) == (180.0, 320.0), engine
+            assert media.shown_size(mf.talk()) == (320.0, 180.0), engine
+            assert media.shown_size(mf.song()) is None, engine
+        finally:
+            media._shown.clear()
+            media._av.clear()
 
 
 def test_canon_orientation():

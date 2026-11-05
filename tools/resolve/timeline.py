@@ -425,3 +425,190 @@ def delete_timelines(project, media_pool, timelines, keep=None) -> list[str]:
                 media_pool.DeleteClips(pool_items)
         left = attempt(as_clips)
     return left
+
+
+# ---- changing the open timeline in place ----------------------------------------------------------
+# Resolve's scripting cannot cut or move a clip. What ZCuts' Update
+# timeline did (engine/11_live_update.py delete_items, append_entries, and
+# CopyGrades for the colour) is the way: take the clips off and put their
+# kept pieces back at exact frames, each piece given its clip's settings.
+
+READ_ONLY = {"Speed"}  # properties Resolve reports but a script cannot set
+
+
+@dataclass
+class Placed:
+    """A clip about to be taken off, with what its pieces need from it."""
+    item: object
+    kind: str  # "video" or "audio"
+    track: int
+    index: int  # its place on the track, left to right (to find it in the backup)
+    pool: object
+    path: str
+    start: int  # timeline frames, end exclusive
+    end: int
+    source_start: int
+    rate: float  # source frames per timeline frame
+    props: dict
+    colour: str
+
+
+def properties(item) -> dict:
+    try:
+        found = item.GetProperty()
+    except Exception:  # noqa: BLE001
+        return {}
+    return {k: v for k, v in dict(found or {}).items() if k not in READ_ONLY}
+
+
+def placed(timeline, kind: str, track: int, index: int, item) -> Optional[Placed]:
+    """What it takes to put this clip's pieces back, or None for a piece
+    with no Media Pool clip (titles, generators), which cannot be added."""
+    try:
+        pool = item.GetMediaPoolItem()
+    except Exception:  # noqa: BLE001
+        pool = None
+    if pool is None:
+        return None
+    tl_fps = timeline_fps(timeline)
+    src_fps = parse_fps(prop(pool, "FPS"), tl_fps) if kind == "video" else tl_fps
+    try:
+        colour = str(item.GetClipColor() or "")
+    except Exception:  # noqa: BLE001
+        colour = ""
+    return Placed(item, kind, track, index, pool, file_of(item), int(item.GetStart()), int(item.GetEnd()),
+                  source_start_of(item), src_fps / tl_fps, properties(item), colour)
+
+
+def every_clip(timeline, kinds=("video", "audio")) -> list[tuple[str, int, int, object]]:
+    """(kind, track, index, item) of every piece on the timeline."""
+    out = []
+    for kind in kinds:
+        for track in range(1, int(timeline.GetTrackCount(kind) or 0) + 1):
+            row = sorted(timeline.GetItemListInTrack(kind, track) or [], key=lambda i: int(i.GetStart()))
+            out += [(kind, track, index, item) for index, item in enumerate(row)]
+    return out
+
+
+def linked_audio(timeline, video_item) -> list[tuple[int, int, object]]:
+    """(track, index, item) of the sound that came with a video clip: audio
+    over the same frames from the same file (Resolve does not say which
+    pieces are linked)."""
+    path = file_of(video_item)
+    start, end = int(video_item.GetStart()), int(video_item.GetEnd())
+    return [(track, index, item) for kind, track, index, item in every_clip(timeline, ("audio",))
+            if path and int(item.GetStart()) == start and int(item.GetEnd()) == end and file_of(item) == path]
+
+
+def fingerprint(timeline) -> tuple:
+    """What is on a timeline, to tell whether it was changed since."""
+    try:
+        return tuple((kind, track, int(i.GetStart()), int(i.GetEnd()), file_of(i))
+                     for kind, track, _index, i in every_clip(timeline))
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def put_back(project, media_pool, timeline, olds: list[Placed], pieces: dict, backup=None) -> dict:
+    """Take ``olds`` off the timeline and put ``pieces[id(old)]`` back, each
+    (first source frame, end, timeline frame) one piece of that clip on its
+    own track, with the clip's settings, colour label and (copied from the
+    backup, where the clip still is) its grade. Returns counts: added,
+    refused, grades, no_grade."""
+    counts = {"added": 0, "refused": 0, "grades": 0, "no_grade": 0}
+    if not olds:
+        return counts
+    if not timeline.DeleteClips([p.item for p in olds], False):
+        raise RuntimeError("Resolve would not take the clips off the timeline, so nothing was changed.")
+    infos, owners = [], []
+    for old in olds:
+        for first, last, record in pieces.get(id(old), []):
+            if last > first:
+                infos.append({"mediaPoolItem": old.pool, "startFrame": int(first), "endFrame": int(last),
+                              "mediaType": 1 if old.kind == "video" else 2, "trackIndex": old.track,
+                              "recordFrame": int(record)})
+                owners.append(old)
+    added, refused = append(media_pool, infos)
+    counts["refused"] = len(refused)
+    at = {}
+    for kind, track, _index, item in every_clip(timeline):
+        at[(kind, track, int(item.GetStart()))] = item
+    twins = {}
+    if backup is not None:
+        twins = {(kind, track, index): item for kind, track, index, item in every_clip(backup)}
+    grade_groups: dict[int, list] = {}
+    for n, (info, old) in enumerate(zip(infos, owners)):
+        if n in refused:
+            continue
+        piece = at.get((old.kind, old.track, info["recordFrame"]))
+        if piece is None:
+            continue
+        counts["added"] += 1
+        for key, value in old.props.items():
+            try:
+                piece.SetProperty(key, value)
+            except Exception:  # noqa: BLE001
+                pass
+        if old.colour:
+            try:
+                piece.SetClipColor(old.colour)
+            except Exception:  # noqa: BLE001
+                pass
+        if old.kind == "video":
+            grade_groups.setdefault(id(old), [old, []])[1].append(piece)
+    for old, group in grade_groups.values():
+        twin = twins.get((old.kind, old.track, old.index))
+        done = False
+        if twin is not None:
+            try:
+                done = bool(twin.CopyGrades(group))
+            except Exception:  # noqa: BLE001
+                done = False
+        counts["grades" if done else "no_grade"] += len(group)
+    return counts
+
+
+def find_folder_of(media_pool, pool_item):
+    """The Media Pool folder holding this clip (or timeline), or None."""
+    try:
+        wanted = pool_item.GetUniqueId()
+    except Exception:  # noqa: BLE001
+        wanted = None
+    try:
+        folders = [media_pool.GetRootFolder()]
+    except Exception:  # noqa: BLE001
+        return None
+    seen = 0
+    while folders and seen < 500:
+        folder = folders.pop()
+        seen += 1
+        try:
+            for clip in folder.GetClipList() or []:
+                if clip is pool_item or (wanted and clip.GetUniqueId() == wanted):
+                    return folder
+            folders.extend(folder.GetSubFolderList() or [])
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def backup_folder(media_pool, name: str = "Tools backups"):
+    """The Media Pool bin the backups go in, made the first time."""
+    try:
+        root = media_pool.GetRootFolder()
+        for folder in root.GetSubFolderList() or []:
+            if str(folder.GetName()) == name:
+                return folder
+        return media_pool.AddSubFolder(root, name)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def move_to(media_pool, timeline, folder) -> bool:
+    if folder is None:
+        return False
+    try:
+        item = timeline.GetMediaPoolItem()
+        return bool(item is not None and media_pool.MoveClips([item], folder))
+    except Exception:  # noqa: BLE001
+        return False

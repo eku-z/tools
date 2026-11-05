@@ -1,4 +1,5 @@
-"""The five jobs against the stand-in Resolve, with real generated media."""
+"""The five jobs against the stand-in Resolve, with real generated media.
+Every job changes the open timeline; Undo puts the backup back."""
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import media_factory as mf
 from tools.core import Stopped
 from tools.core.work import Context, run_sync
 from tools.resolve import jobs, look
+from tools.resolve import timeline as tl
 from tools.resolve.link import Link
 from tools.resolve.undo import History
 
@@ -22,198 +24,253 @@ def _setup():
     return r, r.project, ctx, logs
 
 
+def _one(ctx, name, options=None):
+    return run_sync(jobs.run(ctx, [(name, options or {})]))
+
+
 def _video(timeline, track=1):
     return timeline.GetItemListInTrack("video", track) or []
+
+
+def _audio(timeline, track=1):
+    return timeline.GetItemListInTrack("audio", track) or []
 
 
 def _contiguous(pieces) -> bool:
     return all(b.start == a.end for a, b in zip(pieces[:-1], pieces[1:]))
 
 
-def test_cut_silences():
+def _undone(ctx, project, timeline, name):
+    message = ctx.history.undo(ctx.link)
+    assert message.startswith("Undone"), message
+    back = project.GetCurrentTimeline()
+    assert back.GetName() == name and back is not timeline and back in project.timelines
+    assert timeline not in project.timelines
+    return back
+
+
+def test_ripple():
+    old = tl.Placed(None, "video", 1, 0, None, "", 100, 200, 1000, 1.0, {}, "")
+    # cut before the clip moves it; cuts inside split it; a cut over its start trims it
+    assert jobs.ripple(old, [(10, 20), (120, 130), (150, 160)]) == [(1000, 1020, 90), (1030, 1050, 110),
+                                                                   (1060, 1100, 130)]
+    assert jobs.ripple(old, [(90, 110)]) == [(1010, 1100, 90)]
+    assert jobs.ripple(old, [(250, 300)]) == [(1000, 1100, 100)]
+    assert jobs.ripple(old, [(90, 210)]) == []
+    double = tl.Placed(None, "video", 1, 0, None, "", 100, 200, 1000, 2.0, {}, "")  # 50 fps on a 25 timeline
+    assert jobs.ripple(double, [(150, 160)]) == [(1000, 1100, 100), (1120, 1200, 150)]
+
+
+def test_cut_silences_in_place():
     r, project, ctx, logs = _setup()
-    path = mf.talk()
-    pool = project.pool_item(path, fps=25, seconds=20, resolution="320x180")
-    original = project.new_timeline("Talk", 25)
-    original.add_clip(pool, 0, 500)  # the whole 20 s
-    original.add_clip(pool, 200, 450)  # 8-18 s again
-    summary = run_sync(jobs.cut_silences(ctx, {"preset": "Natural", "upright": True}))
-    new = project.GetCurrentTimeline()
-    assert new.GetName() == "Talk - Cut" and "Talk - Cut" in summary, summary
-    pieces = _video(new)
+    pool = project.pool_item(mf.talk(), fps=25, seconds=20, resolution="320x180")
+    timeline = project.new_timeline("Talk", 25)
+    first = timeline.add_clip(pool, 0, 500)  # the whole 20 s
+    timeline.add_clip(pool, 200, 450)  # 8-18 s again
+    first[0].props.update(ZoomX=1.2, ZoomY=1.2)
+    first[0].grade, first[0].colour = "warm", "Orange"
+    summary = _one(ctx, "silences", {"preset": "Natural"})
+    assert project.GetCurrentTimeline() is timeline and timeline.GetName() == "Talk", "the same timeline"
+    pieces = _video(timeline)
     got = [(p.source_start, p.source_end) for p in pieces]
     # 3.12-4.88 s and 9.12-10.38 s are cut (padding 0.12 s), in both clips
     assert got == [(0, 78), (122, 228), (260, 500), (200, 228), (260, 450)], got
-    assert _contiguous(pieces) and pieces[0].start == new.GetStartFrame()
-    assert len(new.GetItemListInTrack("audio", 1)) == 5
-    assert len(_video(original)) == 2 and original.GetName() == "Talk"  # untouched
-    assert r.page == "edit"
-    assert "3 silence(s) cut" in summary, summary  # two in the first clip, one in the second
-    message = ctx.history.undo(ctx.link)
-    assert message.startswith("Undone"), message
-    assert project.GetCurrentTimeline() is original and [t.name for t in project.timelines] == ["Talk"]
-
-
-def test_cut_silences_with_a_vertical_copy_and_refused_pieces():
-    r, project, ctx, logs = _setup()
-    pool = project.pool_item(mf.talk(), fps=25, seconds=20, resolution="320x180")
-    # Resolve thinks the file is a frame shorter than the clip claims: the
-    # last piece is refused as a list, then taken one frame shorter.
-    pool.frames = 499
-    original = project.new_timeline("Talk", 25)
-    original.add_clip(pool, 0, 499)
-    original.tracks["video"][0][0].source_end = 500
-    original.tracks["video"][0][0].end += 1
-    run_sync(jobs.cut_silences(ctx, {"also_vertical": True}))
-    names = [t.name for t in project.timelines]
-    assert names == ["Talk", "Talk - Cut", "Talk - Cut 9x16"], names
-    cut = project.timelines[1]
-    assert project.GetCurrentTimeline() is cut
-    assert _video(cut)[-1].source_end == 499  # one frame shorter
-    tall = project.timelines[2]
-    assert (tall.GetSetting("timelineResolutionWidth"), tall.GetSetting("timelineResolutionHeight")) == ("1080", "1920")
-    zoom = _video(tall)[0].props["ZoomX"]
-    assert abs(zoom - (1920 / 1080) ** 2 * 1.002) < 1e-6, zoom
-    assert _video(cut)[0].props["ZoomX"] == 1.0  # the wide one keeps its framing
-    assert ctx.history.undo(ctx.link).startswith("Undone")
+    assert _contiguous(pieces) and pieces[0].start == timeline.GetStartFrame()
+    assert [(p.source_start, p.start) for p in _audio(timeline)] == [(p.source_start, p.start) for p in pieces]
+    assert all(p.props["ZoomX"] == 1.2 and p.grade == "warm" and p.colour == "Orange" for p in pieces[:3])
+    assert "Cut 3 silence(s) from 'Talk'" in summary, summary
+    backup = project.timelines[-1]
+    assert backup.GetName() == "Talk (before Tools)" and len(_video(backup)) == 2
+    assert project.media_pool.folder_of(backup).GetName() == "Tools backups"
+    assert project.media_pool.folder_of(timeline) is project.media_pool.root
+    back = _undone(ctx, project, timeline, "Talk")
+    assert [(p.source_start, p.source_end) for p in _video(back)] == [(0, 500), (200, 450)]
+    assert project.media_pool.folder_of(back) is project.media_pool.root  # back where it was
     assert [t.name for t in project.timelines] == ["Talk"]
 
 
-def test_stop_leaves_an_undoable_timeline():
+def test_other_tracks_stay_or_move_in_step():
+    r, project, ctx, logs = _setup()
+    talk = project.pool_item(mf.talk(), fps=25, seconds=20)
+    broll = project.pool_item(mf.cameras()[0], fps=25, seconds=60)
+    timeline = project.new_timeline("Talk", 25)
+    origin = timeline.GetStartFrame()
+    timeline.add_clip(talk, 0, 500)
+    timeline.add_clip(broll, 0, 75, track=2, start=origin + 250, audio_track=2)  # 10-13 s, over the 2nd silence
+    _one(ctx, "silences", {})
+    assert [p.start - origin for p in _video(timeline, 2)] == [250]  # left where it was
+    assert any("Only V1 and its sound were cut" in line for line in logs), logs
+    ctx.history.undo(ctx.link)
+    timeline = project.GetCurrentTimeline()
+    _one(ctx, "silences", {"all_tracks": True})
+    # with every track cut: it starts inside the 2nd cut (frames 228-260), so it loses its first 10
+    # frames and moves up by both cuts (44 + 32 frames)
+    moved = _video(timeline, 2)
+    assert [(p.start - origin, p.source_start) for p in moved] == [(260 - 44 - 32, 10)], \
+        [(p.start - origin, p.source_start) for p in moved]
+    assert _audio(timeline, 2)[0].start == moved[0].start
+
+
+def test_nothing_to_cut_changes_nothing():
     r, project, ctx, logs = _setup()
     pool = project.pool_item(mf.talk(), fps=25, seconds=20)
-    original = project.new_timeline("Talk", 25)
-    original.add_clip(pool, 0, 500)
-    real_append = project.media_pool.AppendToTimeline
+    timeline = project.new_timeline("Talk", 25)
+    timeline.add_clip(pool, 0, 70)  # 0-2.8 s: no silence
+    summary = _one(ctx, "silences", {})
+    assert "nothing changed" in summary and len(project.timelines) == 1 and not ctx.history.records
 
-    def append_then_stop(infos):
+
+def test_stop_part_way_can_be_undone():
+    r, project, ctx, logs = _setup()
+    pool = project.pool_item(mf.talk(), fps=25, seconds=20)
+    timeline = project.new_timeline("Talk", 25)
+    timeline.add_clip(pool, 0, 500)
+    real = timeline.DeleteClips
+
+    def delete_then_stop(items, ripple=False):
         ctx.stop.set()
-        return real_append(infos)
+        return real(items, ripple)
 
-    project.media_pool.AppendToTimeline = append_then_stop
+    timeline.DeleteClips = delete_then_stop
     try:
-        run_sync(jobs.cut_silences(ctx, {}))
+        run_sync(jobs.run(ctx, [("silences", {}), ("vertical", {})]))
     except Stopped:
         pass
     else:
-        raise AssertionError("the job should have stopped")
-    assert any("unfinished timeline" in line for line in logs), logs
-    assert ctx.history.undo(ctx.link).startswith("Undone")
-    assert [t.name for t in project.timelines] == ["Talk"]
+        raise AssertionError("it should have stopped")
+    assert any("Press Undo" in line for line in logs), logs
+    _undone(ctx, project, timeline, "Talk")
 
 
-def _ab_timeline(project, master_audio=False):
-    a, b, voice = mf.cameras()
+def test_no_backup_no_change():
+    r, project, ctx, logs = _setup()
+    pool = project.pool_item(mf.talk(), fps=25, seconds=20)
+    timeline = project.new_timeline("Talk", 25)
+    timeline.add_clip(pool, 0, 500)
+    timeline.DuplicateTimeline = lambda name: None
+    try:
+        _one(ctx, "silences", {})
+    except RuntimeError as error:
+        assert "backup" in str(error)
+    else:
+        raise AssertionError("no backup, no change")
+    assert [(p.source_start, p.source_end) for p in _video(timeline)] == [(0, 500)]
+
+
+def test_undo_refused_after_your_own_changes():
+    r, project, ctx, logs = _setup()
+    pool = project.pool_item(mf.talk(), fps=25, seconds=20)
+    timeline = project.new_timeline("Talk", 25)
+    timeline.add_clip(pool, 0, 500)
+    _one(ctx, "silences", {})
+    timeline.add_clip(pool, 0, 25, track=3)  # you kept editing
+    message = ctx.history.undo(ctx.link)
+    assert "was changed after Tools" in message and "Talk (before Tools)" in message, message
+    assert timeline in project.timelines
+
+
+def _ab_timeline(project):
+    a, b, _voice = mf.cameras()
     pa = project.pool_item(a, fps=25, seconds=60)
     pb = project.pool_item(b, fps=25, seconds=60)
     t = project.new_timeline("Interview", 25)
     t.add_clip(pa, 0, 1500, track=1)
     t.add_clip(pb, 0, 1450, track=2, start=t.GetStartFrame(), audio_track=2)  # placed together, not in step
-    pv = None
-    if master_audio:
-        pv = project.pool_item(voice, seconds=60, video=False)
-        t.add_clip(pv, 0, 1500, audio_track=3, start=t.GetStartFrame())
-    return t, pa, pb, pv
+    return t, pa, pb
 
 
-def _check_ab(new, pa, pb, fps=25.0):
-    pieces = _video(new)
-    assert len(pieces) >= 5 and _contiguous(pieces)
-    assert [p.pool for p in pieces[:4]] in ([pa, pb, pa, pb], [pb, pa, pb, pa])
-    origin = new.GetStartFrame()
-    # each camera's file time minus its place on the timeline is constant,
-    # and the two differ by camera B's 1.3 s
-    # (1.3 s is 32.5 frames at 25 fps, so a piece can round half a frame either way)
-    lead = {}
-    for p in pieces:
-        lead.setdefault(p.pool, []).append((p.source_start - (p.start - origin)) / fps)
-    assert all(max(v) - min(v) <= 1.0 / fps + 1e-9 for v in lead.values()), lead
-    gap = sum(lead[pa]) / len(lead[pa]) - sum(lead[pb]) / len(lead[pb])
-    assert abs(gap - mf.CAMERA_B_LATE) < 0.05, gap
-    sound = new.GetItemListInTrack("audio", 1)
-    assert len(sound) == 1 and sound[0].start == origin and abs(sound[0].end - pieces[-1].end) <= 2, sound
-    return sound[0]
-
-
-def test_ab_camera_on_the_cameras_own_sound():
+def test_ab_camera_in_place():
     r, project, ctx, logs = _setup()
-    original, pa, pb, _pv = _ab_timeline(project)
-    summary = run_sync(jobs.ab_camera(ctx, {"every": 8, "pauses": True, "sync": True}))
-    new = project.GetCurrentTimeline()
-    assert new.GetName() == "Interview - A-B Cut", summary
-    sound = _check_ab(new, pa, pb)
-    assert sound.pool in (pa, pb)
-    assert any("lined up by sound" in line for line in logs), logs
-    assert "moved to a pause" in summary, summary
+    timeline, pa, pb = _ab_timeline(project)
+    summary = _one(ctx, "ab", {"every": 8, "pauses": True, "sync": True})
+    assert project.GetCurrentTimeline() is timeline
+    assert [(p.source_start, p.source_end) for p in _video(timeline, 1)] == [(0, 1500)]  # camera A stays
+    b = _video(timeline, 2)
+    assert len(b) >= 3 and all(p.pool is pb for p in b)
+    origin = timeline.GetStartFrame()
+    for p in b:  # B is in step with A: B's file time = A's time - 1.3 s (half a frame either way)
+        assert abs((p.source_start - (p.start - origin)) / 25.0 + mf.CAMERA_B_LATE) <= 0.5 / 25 + 1e-9, p.source_start
+    assert all(b2.start > b1.end for b1, b2 in zip(b[:-1], b[1:]))  # A shows in between
+    assert not _audio(timeline, 2) and len(_audio(timeline, 1)) == 1  # A's sound plays throughout
+    assert "moved to a pause" in summary and any("lined up by sound" in line for line in logs), (summary, logs)
 
 
-def test_ab_camera_with_a_separate_recorder():
+def test_ab_without_sync_uses_where_you_placed_them():
     r, project, ctx, logs = _setup()
-    original, pa, pb, pv = _ab_timeline(project, master_audio=True)
-    run_sync(jobs.ab_camera(ctx, {"every": 5}))
-    new = project.GetCurrentTimeline()
-    sound = _check_ab(new, pa, pb)
-    assert sound.pool is pv
-    assert any("separate recording" in line for line in logs), logs
+    timeline, pa, pb = _ab_timeline(project)
+    _one(ctx, "ab", {"every": 5})
+    origin = timeline.GetStartFrame()
+    assert all(p.source_start == p.start - origin for p in _video(timeline, 2))
 
 
-def test_montage():
+def test_cut_to_a_song_on_the_timeline():
     r, project, ctx, logs = _setup()
     a, b, _voice = mf.cameras()
     clips = [project.pool_item(p, fps=25, seconds=s, resolution="320x180")
              for p, s in ((mf.talk(), 20), (a, 60), (b, 60))]
     song = project.pool_item(mf.song(), seconds=30, video=False)
     t = project.new_timeline("Trip", 25)
+    origin = t.GetStartFrame()
     t.add_clip(clips[0], 0, 100)
     t.add_clip(clips[1], 250, 400)
     t.add_clip(clips[2], 0, 75)
-    t.add_clip(song, 0, 750, audio_track=2, start=t.GetStartFrame())
-    summary = run_sync(jobs.montage_job(ctx, {"per_cut": 0, "lead": 1, "fill_song": True, "mute": True}))
-    new = project.GetCurrentTimeline()
-    assert new.GetName() == "Trip - Montage", summary
-    pieces = _video(new)
-    origin = new.GetStartFrame()
+    t.add_clip(song, 0, 750, audio_track=2, start=origin)
+    summary = _one(ctx, "montage", {"lead": 1, "fill_song": True, "mute": True})
+    assert project.GetCurrentTimeline() is t and "to the beat" in summary, summary
+    pieces = _video(t)
     assert _contiguous(pieces) and pieces[0].start == origin
     for p in pieces[:-1]:  # every cut one frame before a beat (beats every 12.5 frames)
         beat = (p.end - origin + 1) / 12.5
         assert abs(beat - round(beat)) < 0.05, (p.end - origin, beat)
-    assert not new.GetItemListInTrack("audio", 1) or new.GetItemListInTrack("audio", 1)[0].pool is song
-    music = [i for k in range(1, new.GetTrackCount("audio") + 1) for i in new.GetItemListInTrack("audio", k)]
-    assert len(music) == 1 and music[0].pool is song and music[0].end - music[0].start == 750, music
-    assert pieces[-1].end - origin >= 750 - 20  # the whole song has pictures
-    tempo = next(float(line.split("|")[1].split()[0]) for line in logs if line.startswith("Song:"))
-    assert abs(tempo - mf.BPM) < 0.1, logs
-    # the beats are remembered for next time
-    logs.clear()
-    project.SetCurrentTimeline(t)
-    run_sync(jobs.montage_job(ctx, {}))
-    assert any("remembered" in line for line in logs), logs
+    assert not _audio(t, 1), "no camera sound"
+    assert [(i.pool, i.start, i.end) for i in _audio(t, 2)] == [(song, origin, origin + 750)]  # the song stays
+    assert pieces[-1].end - origin >= 750 - 20
 
 
-def test_vertical_and_upright():
+def test_cut_to_a_set_tempo():
+    r, project, ctx, logs = _setup()
+    a, b, _voice = mf.cameras()
+    clips = [project.pool_item(p, fps=25, seconds=60, resolution="320x180") for p in (a, b)]
+    t = project.new_timeline("Trip", 25)
+    t.add_clip(clips[0], 0, 250)  # 10 s
+    t.add_clip(clips[1], 500, 700)  # 8 s
+    try:
+        _one(ctx, "montage", {"no_song": True, "bpm": 0})
+    except RuntimeError as error:
+        assert "type the tempo" in str(error)
+    else:
+        raise AssertionError("a tempo is needed")
+    summary = _one(ctx, "montage", {"no_song": True, "bpm": 100, "per_cut": 4})
+    assert "at 100 BPM" in summary, summary
+    pieces = _video(t)
+    origin = t.GetStartFrame()
+    assert _contiguous(pieces) and len(pieces) == 2
+    assert all(p.end - p.start == 60 for p in pieces)  # 4 beats of 15 frames
+    assert [p.source_start for p in pieces] == [95, 570]  # the middle of each clip
+    assert [(p.pool, p.start) for p in _audio(t)] == [(p.pool, p.start) for p in pieces]  # their own sound
+    assert pieces[0].start == origin
+
+
+def test_vertical_in_place():
     r, project, ctx, logs = _setup()
     wide = project.pool_item(mf.talk(), fps=25, seconds=20, resolution="320x180")
     side = project.pool_item(mf.canon_side(), fps=25, seconds=4, resolution="320x180")
+    phone = project.pool_item(mf.phone_portrait(), fps=25, seconds=2, resolution="320x180")
     t = project.new_timeline("Mixed", 25)
-    t.add_clip(wide, 0, 100)
-    t.add_clip(side, 0, 100)
-    run_sync(jobs.vertical(ctx, {"upright": True}))
-    tall = project.GetCurrentTimeline()
-    assert tall.GetName() == "Mixed 9x16"
-    a, b = _video(tall)
+    for pool, n in ((wide, 100), (side, 100), (phone, 50)):
+        t.add_clip(pool, 0, n)
+    _one(ctx, "vertical", {"upright": True})
+    assert (t.GetSetting("timelineResolutionWidth"), t.GetSetting("timelineResolutionHeight")) == ("1080", "1920")
+    a, b, c = _video(t)
     assert abs(a.props["ZoomX"] - (1920 / 1080) ** 2 * 1.002) < 1e-6 and a.props["RotationAngle"] == 0.0
     assert b.props["RotationAngle"] == 90.0 and abs(b.props["ZoomX"] - 1920 / 1080 * 1.002) < 1e-6, b.props
-    assert _video(t)[1].props["RotationAngle"] == 0.0  # the original is untouched
-    project.SetCurrentTimeline(tall)
-    try:
-        run_sync(jobs.vertical(ctx, {}))
-    except RuntimeError as error:
-        assert "already vertical" in str(error)
-    else:
-        raise AssertionError("a vertical timeline should be refused")
+    assert c.props["ZoomX"] == 1.0, "the phone clip is shown tall already"
+    assert "already vertical" in _one(ctx, "vertical", {})
+    back = _undone(ctx, project, t, "Mixed")
+    assert back.GetSetting("timelineResolutionWidth") == "1920" and _video(back)[0].props["ZoomX"] == 1.0
 
 
-def test_look_copy_puts_the_lut_on():
+def test_look_in_place():
     r, project, ctx, logs = _setup()
     folder = tempfile.mkdtemp(prefix="tools_luts_")
     os.makedirs(os.path.join(folder, "Film"))
@@ -226,45 +283,69 @@ def test_look_copy_puts_the_lut_on():
     finally:
         del os.environ["TOOLS_LUT_DIR"]
     names = list(luts)  # (Resolve's own LUTs on this computer are listed too)
-    assert "Mine" in names and "Film / Warm" in names
     assert names.index("Mine") < min(i for i, n in enumerate(names) if " / " in n)  # your own first
-    wide = project.pool_item(mf.talk(), fps=25, seconds=20)
+    four_three = project.pool_item(mf.four_three(), fps=25, seconds=2, resolution="240x180")
+    full = project.pool_item(mf.talk(), fps=25, seconds=20, resolution="320x180")
+    phone = project.pool_item(mf.phone_portrait(), fps=25, seconds=2, resolution="320x180")
     side = project.pool_item(mf.canon_side(), fps=25, seconds=4, resolution="320x180")
-    t = project.new_timeline("Grade", 25)
-    t.add_clip(wide, 0, 100)
-    t.add_clip(side, 0, 100)
+    t = project.new_timeline("Mixed", 25)
+    for pool in (four_three, full, full, full, phone, side):
+        t.add_clip(pool, 0, 50)
+    _video(t)[2].props["Pan"] = 96.0  # moved right by hand: its left edge would show
+    _video(t)[3].props.update(ZoomX=1.5, ZoomY=1.5)  # zoomed in by hand: already covers
     r.lut_by_graph = True  # newer Resolve: only through the node graph
-    run_sync(jobs.look_copy(ctx, {"lut_path": luts["Mine"], "upright": True}))
-    copy = project.GetCurrentTimeline()
-    assert copy.GetName() == "Grade - Look"
-    assert [p.lut for p in _video(copy)] == [luts["Mine"]] * 2
-    assert _video(copy)[1].props["RotationAngle"] == 90.0
-    assert abs(_video(copy)[1].props["ZoomX"] - 1080 / 1920) < 1e-6  # shown whole on a wide frame
-    assert all(p.lut is None for p in _video(t))
-    # nothing to do: refused, nothing made
-    project.SetCurrentTimeline(t)
-    t.tracks["video"][0].pop()
-    try:
-        run_sync(jobs.look_copy(ctx, {"lut_path": "", "upright": True}))
-    except RuntimeError as error:
-        assert "Nothing to do" in str(error)
-    else:
-        raise AssertionError("expected a refusal")
-    assert [x.name for x in project.timelines] == ["Grade", "Grade - Look"]
+    assert "nothing changed" in _one(ctx, "look", {})  # nothing picked
+    _one(ctx, "look", {"lut_path": luts["Mine"], "upright": True, "fill": True})
+    pieces = _video(t)
+    assert [p.lut for p in pieces] == [luts["Mine"]] * 6
+    zooms = [round(p.props["ZoomX"], 4) for p in pieces]
+    expected = [round(1920 / 1440 * 1.002, 4),  # 4:3 fitted to 1440x1080: bars at the sides
+                1.0,  # already fills
+                round(2112 / 1920 * 1.002, 4),  # 1920 + 2 x 96 px
+                1.5,  # your own zoom is kept
+                round(1920 / 607.5 * 1.002, 4),  # portrait phone clip, shown 607.5x1080
+                round(1920 / 1080 * 1.002, 4)]  # Canon on its side, turned: 1080x1920 shown
+    assert zooms == expected, (zooms, expected)
+    assert pieces[5].props["RotationAngle"] == 90.0
+    back = _undone(ctx, project, t, "Mixed")
+    assert all(p.lut is None for p in _video(back))
+
+
+def test_apply_does_the_ticked_jobs_as_one_undo():
+    r, project, ctx, logs = _setup()
+    pool = project.pool_item(mf.talk(), fps=25, seconds=20, resolution="320x180")
+    timeline = project.new_timeline("Talk", 25)
+    timeline.add_clip(pool, 0, 500)
+    summary = run_sync(jobs.run(ctx, [("silences", {}), ("ab", {}), ("vertical", {}), ("look", {"fill": True})]))
+    assert "Applied 4 job(s) to 'Talk'" in summary, summary
+    assert any(line.startswith("A/B camera: not done.") for line in logs), logs
+    assert len(_video(timeline)) == 3 and timeline.GetSetting("timelineResolutionHeight") == "1920"
+    assert [t.name for t in project.timelines] == ["Talk", "Talk (before Tools)"]  # one backup
+    back = _undone(ctx, project, timeline, "Talk")
+    assert len(_video(back)) == 1 and back.GetSetting("timelineResolutionHeight") == "1080"
+    assert ctx.history.undo(ctx.link) == "Nothing to undo."
+
+
+def test_grades_that_cannot_be_copied_are_said():
+    r, project, ctx, logs = _setup()
+    r.no_copy_grades = True
+    pool = project.pool_item(mf.talk(), fps=25, seconds=20)
+    project.new_timeline("Talk", 25).add_clip(pool, 0, 500)
+    _one(ctx, "silences", {})
+    assert any("would not copy the grade onto 3 piece(s)" in line for line in logs), logs
 
 
 def test_undo_after_reconnecting_is_refused():
     r, project, ctx, logs = _setup()
     pool = project.pool_item(mf.talk(), fps=25, seconds=20)
     project.new_timeline("Talk", 25).add_clip(pool, 0, 500)
-    run_sync(jobs.cut_silences(ctx, {}))
+    _one(ctx, "silences", {})
     r.closed = True
-    assert ctx.link.project() is None  # the old link is gone
+    assert ctx.link.project() is None
     r.closed = False
-    ctx.link.ensure()  # a new link
+    ctx.link.ensure()
     message = ctx.history.undo(ctx.link)
-    assert "connect to Resolve again" in message, message
-    assert len(project.timelines) == 2
+    assert "connect to Resolve again" in message and "Talk (before Tools)" in message, message
 
 
 def test_resolve_closed_and_opened_again():
@@ -272,9 +353,8 @@ def test_resolve_closed_and_opened_again():
     running = [True]
     link = Link(factory=lambda: (r, ""), running=lambda: running[0])
     assert link.ensure() is r.project and link.generation == 1
-    r.project.name = None  # Resolve answers None once it is gone...
     r.manager.GetCurrentProject = lambda: None
-    running[0] = False  # ...and its window has closed
+    running[0] = False
     assert link.ensure() is None and link.problem == "DaVinci Resolve is not open." and link.resolve is None
     running[0] = True
     r2 = fake.Resolve()
@@ -282,25 +362,11 @@ def test_resolve_closed_and_opened_again():
     assert link.ensure() is r2.project and link.generation == 2
 
 
-def test_a_failed_vertical_copy_keeps_the_cut():
-    r, project, ctx, logs = _setup()
-    pool = project.pool_item(mf.talk(), fps=25, seconds=20)
-    project.new_timeline("Talk", 25).add_clip(pool, 0, 500)
-    real = fake.Timeline.DuplicateTimeline
-    fake.Timeline.DuplicateTimeline = lambda self, name: None  # Resolve refuses the copy
-    try:
-        summary = run_sync(jobs.cut_silences(ctx, {"also_vertical": True}))
-    finally:
-        fake.Timeline.DuplicateTimeline = real
-    assert "Made 'Talk - Cut'" in summary and any(line.startswith("No 9:16 copy") for line in logs), logs
-    assert [t.name for t in project.timelines] == ["Talk", "Talk - Cut"]
-
-
 def test_no_resolve_says_why():
     link = Link(factory=lambda: (None, "Tools cannot connect to DaVinci Resolve."))
     ctx = Context(link, History())
     try:
-        run_sync(jobs.cut_silences(ctx, {}))
+        _one(ctx, "silences")
     except RuntimeError as error:
         assert "cannot connect" in str(error)
     else:

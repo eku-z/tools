@@ -1,4 +1,4 @@
-"""The window, offscreen: a job run through the Qt runner, Undo, settings."""
+"""The window, offscreen: rows, Run, Apply, Undo, settings."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from tools.app import settings as store
 from tools.resolve.link import Link
 
 _app = []
+NAMES = ("silences", "ab", "montage", "vertical", "look")
 
 
 def _qt():
@@ -37,75 +38,115 @@ def _wait(window, seconds=30.0):
     assert not window.runner.busy, "the job did not finish"
 
 
-def _window(r):
+def _window(r, settings=None):
     from tools.app.window import MainWindow
 
     _qt()
-    window = MainWindow(link=Link(factory=lambda: (r, "")), settings=store.load(), poll=False)
+    window = MainWindow(link=Link(factory=lambda: (r, "")), settings=settings or store.load(), poll=False)
     window.show()
     return window
 
 
-def test_a_job_from_the_window_and_undo():
+def _talk():
     r = fake.Resolve()
     pool = r.project.pool_item(mf.talk(), fps=25, seconds=20)
-    r.project.new_timeline("Talk", 25).add_clip(pool, 0, 500)
-    window = _window(r)
+    timeline = r.project.new_timeline("Talk", 25)
+    timeline.add_clip(pool, 0, 500)
+    return r, timeline
+
+
+def test_one_job_from_its_row_and_undo():
+    r, timeline = _talk()
+    window = _window(r, store.load_defaults())
     window.refresh_status()
-    assert "Talk" in window.status.text(), window.status.text()
-    window.tabs.setCurrentIndex(0)
-    window.run("silences")
-    assert window.stop.isEnabled() and not window.go_silences.isEnabled()
+    assert window.status.text().endswith("Talk"), window.status.text()
+    window.rows["silences"]["go"].click()
+    assert window.stop.isVisible() and not window.apply.isVisible()
     _wait(window)
-    text = window.log_view.toPlainText()
-    assert "Made 'Talk - Cut'" in text, text
-    assert window.step.text().startswith("Done in"), window.step.text()
-    assert window.undo.isEnabled() and window.go_silences.isEnabled()
-    assert r.project.GetCurrentTimeline().GetName() == "Talk - Cut"
+    assert window.step.text().startswith("Cut 2 silence(s) from 'Talk'"), window.step.text()
+    assert len(timeline.GetItemListInTrack("video", 1)) == 3 and r.project.GetCurrentTimeline() is timeline
+    assert window.undo.isEnabled() and window.apply.isVisible()
     window.undo.click()
-    assert "Undone" in window.log_view.toPlainText()
-    assert [t.name for t in r.project.timelines] == ["Talk"] and not window.undo.isEnabled()
+    assert window.step.text().startswith("Undone"), window.step.text()
+    assert len(r.project.GetCurrentTimeline().GetItemListInTrack("video", 1)) == 1 and not window.undo.isEnabled()
     window.close()
 
 
-def test_errors_and_stop_show_in_the_log():
+def test_apply_does_what_is_ticked():
+    r, timeline = _talk()
+    window = _window(r, store.load_defaults())
+    assert not window.apply.isEnabled() and window.apply.text() == "Apply"
+    window.rows["silences"]["tick"].setChecked(True)
+    window.rows["vertical"]["tick"].setChecked(True)
+    assert window.apply.isEnabled() and window.apply.text() == "Apply 2"
+    window.apply.click()
+    _wait(window)
+    assert "Applied 2 job(s) to 'Talk'" in window.step.text(), window.step.text()
+    assert timeline.GetSetting("timelineResolutionHeight") == "1920" and len(timeline.GetItemListInTrack("video", 1)) == 3
+    window.undo.click()
+    back = r.project.GetCurrentTimeline()
+    assert back.GetSetting("timelineResolutionHeight") == "1080" and len(back.GetItemListInTrack("video", 1)) == 1
+    window.close()
+
+
+def test_errors_and_stop():
     r = fake.Resolve()
     r.project.new_timeline("Empty", 25)
-    window = _window(r)
+    window = _window(r, store.load_defaults())
     window.run("ab")
     _wait(window)
-    assert "needs two different camera files" in window.log_view.toPlainText()
-    assert window.step.text() == "Not done"
+    assert window.step.text().startswith("Not done: The A/B cut needs two"), window.step.text()
     pool = r.project.pool_item(mf.talk(), fps=25, seconds=20)
     r.project.current.add_clip(pool, 0, 500)
     window.run("silences")
     window._stop()  # before the sound is read
     _wait(window)
-    assert window.log_view.toPlainText().rstrip().endswith("Stopped."), window.log_view.toPlainText()
-    assert [t.name for t in r.project.timelines] == ["Empty"]
+    assert window.step.text() == "Stopped." and len(r.project.timelines) == 1
+    window.close()
+
+
+def test_options_are_hidden_until_asked_and_everything_starts_off():
+    r, _timeline = _talk()
+    window = _window(r, store.load_defaults())
+    boxes = [window.a_pauses, window.a_sync, window.m_no_song, window.m_fill, window.m_pace, window.m_mute,
+             window.l_fill, window.l_upright, window.v_upright, window.s_all] + \
+        [window.rows[name]["tick"] for name in NAMES]
+    assert not any(box.isChecked() for box in boxes), [b.text() for b in boxes if b.isChecked()]
+    assert window.lut.currentText() == "None" and window.m_lead.value() == 0
+    assert not any(window.rows[name]["options"].isVisible() for name in NAMES)
+    assert not window.log_view.isVisible()
+    small = window.height()
+    gear = [b for b in window.rows["montage"]["frame"].findChildren(type(window.log_button)) if b.text() == "⚙"][0]
+    gear.click()
+    _qt().processEvents()
+    assert window.rows["montage"]["options"].isVisible()
+    window.m_no_song.setChecked(True)
+    assert not window.m_song.isEnabled() and window.m_bpm.specialValueText() == "Type one"
+    gear.click()
+    _qt().processEvents()
+    assert not window.rows["montage"]["options"].isVisible()
+    assert window.height() <= small + 2, (window.height(), small)
     window.close()
 
 
 def test_settings_are_kept():
-    r = fake.Resolve()
-    r.project.new_timeline("Edit", 25)
-    window = _window(r)
+    r, _timeline = _talk()
+    window = _window(r, store.load_defaults())
+    window.rows["look"]["tick"].setChecked(True)
     window.s_preset.setCurrentText("Custom")
     window.s_threshold.setValue(-42)
-    window.a_every.setCurrentText("12 s")
+    window.a_every.setCurrentText("every 12 s")
     window.m_song.setText(r"D:\Music\song.mp3")
-    window.also_vertical.setChecked(True)
-    window.tabs.setCurrentIndex(2)
+    window.l_fill.setChecked(True)
     window.close()
     with open(os.path.join(store.data_dir(), "settings.json"), encoding="utf-8") as fh:
         saved = json.load(fh)
-    assert saved["silences"]["threshold_db"] == -42 and saved["ab"]["every"] == 12, saved
+    assert saved["silences"]["threshold_db"] == -42 and saved["ab"]["every"] == 12 and saved["ticked"]["look"]
     again = _window(r)
     assert again.s_threshold.value() == -42 and again.s_threshold.isEnabled()
-    assert again.m_song.text() == r"D:\Music\song.mp3" and again.also_vertical.isChecked()
-    assert again.tabs.currentIndex() == 2
-    options = again.options("silences")
-    assert options["preset"] == "Custom" and options["also_vertical"] is True and options["lut_path"] == ""
+    assert again.m_song.text() == r"D:\Music\song.mp3" and again.l_fill.isChecked()
+    assert again.rows["look"]["tick"].isChecked() and again.apply.text() == "Apply 1"
+    assert again.options("look")["fill"] is True and again.options("look")["lut_path"] == ""
     again.close()
 
 

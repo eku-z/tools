@@ -7,13 +7,19 @@ import json
 import os
 import sys
 
+# Every switch starts off (owner, 4 Nov 2026): you tick what you want by hand.
+VERSION = 3  # settings saved by an older version are not used (their layout changed)
 DEFAULTS = {
-    "tab": 0,
-    "silences": {"track": "Auto", "preset": "Natural", "threshold_db": -35, "minimum_ms": 400, "padding_ms": 120},
-    "ab": {"every": 8, "pauses": True, "sync": True},
-    "montage": {"track": "Auto", "song_path": "", "per_cut": 0, "song_start": 0, "bpm": 0, "lead": 1,
-                "fill_song": True, "pace": False, "mute": True},
-    "finish": {"lut": "None", "upright": True, "also_vertical": False},
+    "version": VERSION,
+    "ticked": {"silences": False, "ab": False, "montage": False, "vertical": False, "look": False},
+    "log_open": False,
+    "silences": {"track": "Auto", "preset": "Natural", "threshold_db": -35, "minimum_ms": 400, "padding_ms": 120,
+                 "all_tracks": False},
+    "ab": {"every": 8, "pauses": False, "sync": False},
+    "montage": {"track": "Auto", "song_path": "", "no_song": False, "per_cut": 0, "song_start": 0, "bpm": 0,
+                "lead": 0, "fill_song": False, "pace": False, "mute": False},
+    "vertical": {"upright": False},
+    "look": {"lut": "None", "upright": False, "fill": False},
 }
 
 
@@ -28,12 +34,18 @@ def data_dir() -> str:
     return path
 
 
+def load_defaults() -> dict:
+    return json.loads(json.dumps(DEFAULTS))
+
+
 def load() -> dict:
-    settings = json.loads(json.dumps(DEFAULTS))
+    settings = load_defaults()
     try:
         with open(os.path.join(data_dir(), "settings.json"), "r", encoding="utf-8") as fh:
             saved = json.load(fh)
     except (OSError, ValueError):
+        return settings
+    if not isinstance(saved, dict) or saved.get("version") != VERSION:
         return settings
     for key, value in saved.items():
         if isinstance(settings.get(key), dict) and isinstance(value, dict):

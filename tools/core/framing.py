@@ -65,15 +65,19 @@ def fitted_size(source_size, frame_size, mode="scaleToFit"):
     return source_w * fit, source_h * fit
 
 
-def cover_zoom(source_size, frame_size, degrees=0.0, mode="scaleToFit", spare=1.02, margin=0.0):
+def cover_zoom(source_size, frame_size, degrees=0.0, mode="scaleToFit", spare=1.02, margin=0.0, shift=(0.0, 0.0)):
     """Zoom needed so a (slightly) rotated picture still fills the whole
     frame. Resolve first fits the clip inside the frame, so a clip whose
     shape differs from the timeline's starts out smaller in one direction;
-    that is included."""
+    that is included. ``shift`` is how far the picture was moved (Resolve's
+    Pan and Tilt, in timeline pixels): the edge it moved away from needs
+    that much more picture."""
     frame_w, frame_h = frame_size
     picture_w, picture_h = fitted_size(source_size, frame_size, mode)
-    radians = math.radians(abs(degrees))
-    wide, high = frame_w + 2.0 * margin, frame_h + 2.0 * margin
+    folded = abs(degrees) % 180.0  # a half turn needs no more than none
+    radians = math.radians(min(folded, 180.0 - folded))
+    wide = frame_w + 2.0 * (margin + abs(shift[0]))
+    high = frame_h + 2.0 * (margin + abs(shift[1]))
     need_w = wide * math.cos(radians) + high * math.sin(radians)
     need_h = wide * math.sin(radians) + high * math.cos(radians)
     return max(need_w / picture_w, need_h / picture_h) * spare

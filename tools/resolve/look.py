@@ -1,7 +1,7 @@
-"""LUTs, sideways clips and the 9:16 framing, ported from ZCuts
-(engine/13_colour.py lut_folders, find_luts, apply_lut; engine/15_picture.py
-fix_picture's quarter-turn and fill branches; engine/10_ab_camera.py
-vertical_of_open; build 259).
+"""LUTs, sideways clips, filling the frame and the 9:16 framing, ported
+from ZCuts (engine/13_colour.py lut_folders, find_luts, apply_lut;
+engine/15_picture.py fix_picture's quarter-turn and FillFrame branches;
+engine/10_ab_camera.py vertical_of_open; build 259).
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 
 from tools.core import camera
-from tools.core.framing import placement
+from tools.core.framing import cover_zoom, placement
 from tools.resolve import timeline as tl
 
 LUT_EXTENSIONS = (".cube", ".3dl", ".dat", ".olut", ".ilut", ".davlut", ".mga", ".m3d", ".clf")
@@ -82,6 +82,56 @@ def video_pieces(timeline) -> list:
     return [p for p in tl.items(timeline, "video") if tl.file_of(p)]
 
 
+def shown_size(piece, frame):
+    """The clip's picture size as Resolve shows it before any zoom: from the
+    file (a portrait phone clip is 1080x1920 even when it is stored
+    1920x1080), else Resolve's Resolution, else the frame's."""
+    from tools.core import media  # (NumPy loads with it: never before the window shows)
+
+    path = tl.file_of(piece)
+    size = media.shown_size(path) if path else None
+    if size is None:
+        try:
+            size = tl.parse_size(tl.prop(piece.GetMediaPoolItem(), "Resolution"))
+        except Exception:  # noqa: BLE001
+            size = None
+    return size or frame
+
+
+def _number(piece, key: str, default: float) -> float:
+    try:
+        value = piece.GetProperty(key)
+        return default if value in (None, "") else float(value)
+    except Exception:  # noqa: BLE001 - not a number, or Resolve did not answer
+        return default
+
+
+def fill_frame(project, timeline, pieces) -> dict:
+    """Zoom every clip just enough that no black bar or edge can show,
+    counting its rotation and how far it was moved (Pan, Tilt). A clip
+    already zoomed in enough is left as it is. Returns counts: filled,
+    already, refused."""
+    frame = tl.frame_size(timeline)
+    mode = tl.mismatch_mode(timeline, project)
+    counts = {"filled": 0, "already": 0, "refused": 0}
+    for piece in pieces:
+        zoom_x, zoom_y = _number(piece, "ZoomX", 1.0), _number(piece, "ZoomY", 1.0)
+        exact = cover_zoom(shown_size(piece, frame), frame, _number(piece, "RotationAngle", 0.0), mode, 1.0,
+                           shift=(_number(piece, "Pan", 0.0), _number(piece, "Tilt", 0.0)))
+        if min(zoom_x, zoom_y) >= exact - 1e-6:
+            counts["already"] += 1
+            continue
+        needed = exact * 1.002  # a little spare, so rounding never leaves a one-pixel line
+        try:
+            piece.SetProperty("ZoomX", max(zoom_x, needed))
+            piece.SetProperty("ZoomY", max(zoom_y, needed))
+        except Exception:  # noqa: BLE001
+            counts["refused"] += 1
+            continue
+        counts["filled"] += 1
+    return counts
+
+
 def frame_pieces(project, timeline, pieces, upright: bool, fill: bool, reset: bool = False) -> dict:
     """Turn sideways clips upright and, with ``fill``, zoom every clip to
     cover the frame (the 9:16 copy). ``reset`` first puts each piece back to
@@ -92,10 +142,7 @@ def frame_pieces(project, timeline, pieces, upright: bool, fill: bool, reset: bo
     counts = {"turned": 0, "filled": 0, "refused": 0}
     for piece in pieces:
         path = tl.file_of(piece)
-        try:
-            size = tl.parse_size(tl.prop(piece.GetMediaPoolItem(), "Resolution")) or frame
-        except Exception:  # noqa: BLE001
-            size = frame
+        size = shown_size(piece, frame)
         turn = camera.file_turn(path) if (upright and path) else 0
         if not turn and not fill and not reset:
             continue
@@ -121,7 +168,7 @@ def finish(project, timeline, options, log) -> None:
     """The finishing touches every new timeline gets: sideways clips upright
     and the LUT on every clip."""
     pieces = video_pieces(timeline)
-    if options.get("upright", True):
+    if options.get("upright", False):
         counts = frame_pieces(project, timeline, pieces, upright=True, fill=False)
         if counts["turned"]:
             log("Turned upright: {} clip(s) filmed with the camera on its side.".format(counts["turned"]))

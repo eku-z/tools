@@ -23,6 +23,9 @@ class PoolItem:
         self.name = name or os.path.basename(path)
         self.id = next(_ids)
 
+    def GetUniqueId(self):
+        return "pool-{}".format(self.id)
+
     def GetClipProperty(self, name):
         return {"File Path": self.path, "FPS": "{:g}".format(self.fps) if self.video else "",
                 "Resolution": self.resolution if self.video else "", "Type": "Video" if self.video else "Audio"
@@ -49,10 +52,29 @@ class Item:
         self.props = {"ZoomX": 1.0, "ZoomY": 1.0, "RotationAngle": 0.0, "Pan": 0.0, "Tilt": 0.0, "ZoomGang": True,
                       "Speed": "100"}
         self.lut = None
+        self.grade = None  # stands in for the node graph
+        self.colour = ""
         self.id = next(_ids)
 
     def GetName(self):
         return self.pool.name if self.pool else "Title"
+
+    def GetUniqueId(self):
+        return "item-{}".format(self.id)
+
+    def GetClipColor(self):
+        return self.colour
+
+    def SetClipColor(self, colour):
+        self.colour = colour
+        return True
+
+    def CopyGrades(self, targets):
+        if self.timeline.resolve.no_copy_grades:
+            return False
+        for target in targets:
+            target.grade, target.lut = self.grade, self.lut
+        return True
 
     def GetStart(self):
         return self.start
@@ -72,8 +94,8 @@ class Item:
     def GetMediaPoolItem(self):
         return self.pool
 
-    def GetProperty(self, key):
-        return self.props.get(key)
+    def GetProperty(self, key=None):
+        return dict(self.props) if key is None else self.props.get(key)
 
     def SetProperty(self, key, value):
         self.props[key] = value
@@ -97,7 +119,25 @@ class Timeline:
         self.tracks = {"video": [[]], "audio": [[]]}
         self.markers = []
         self.pool_item = PoolItem("", name=name, video=False, audio=False)
+        self.pool_item.timeline = self
+        project.media_pool.current.clips.append(self.pool_item)
         self.id = next(_ids)
+
+    def SetName(self, name):
+        if any(t.name == name for t in self.project.timelines if t is not self):
+            return False
+        self.name = self.pool_item.name = name
+        return True
+
+    def DeleteClips(self, items, ripple=False):
+        found = 0
+        for kind in ("video", "audio"):
+            for track in self.tracks[kind]:
+                for item in list(track):
+                    if any(item is x for x in items):
+                        track.remove(item)
+                        found += 1
+        return found == len(items)
 
     @property
     def fps(self):
@@ -149,7 +189,7 @@ class Timeline:
             for track in self.tracks[kind]:
                 new_track = []
                 for item in track:
-                    twin = copy.copy(item)
+                    twin = copy.copy(item)  # (lut, grade and colour come along)
                     twin.props = dict(item.props)
                     twin.timeline = copy_
                     twin.id = next(_ids)
@@ -183,23 +223,55 @@ class Timeline:
 
 
 class Folder:
-    def __init__(self, media_pool):
-        self.media_pool = media_pool
+    def __init__(self, name):
+        self.name = name
+        self.clips: list = []
+        self.folders: list = []
+
+    def GetName(self):
+        return self.name
 
     def GetClipList(self):
-        return list(self.media_pool.clips)
+        return list(self.clips)
 
     def GetSubFolderList(self):
-        return []
+        return list(self.folders)
 
 
 class MediaPool:
     def __init__(self, project):
         self.project, self.resolve = project, project.resolve
-        self.clips: list[PoolItem] = []
+        self.root = Folder("Master")
+        self.current = self.root
+
+    @property
+    def clips(self):
+        return self.root.clips
 
     def GetRootFolder(self):
-        return Folder(self)
+        return self.root
+
+    def AddSubFolder(self, parent, name):
+        folder = Folder(name)
+        parent.folders.append(folder)
+        return folder
+
+    def _all(self, folder=None):
+        folder = folder or self.root
+        yield folder
+        for sub in folder.folders:
+            yield from self._all(sub)
+
+    def MoveClips(self, clips, folder):
+        for clip in clips:
+            for f in self._all():
+                if clip in f.clips:
+                    f.clips.remove(clip)
+            folder.clips.append(clip)
+        return True
+
+    def folder_of(self, timeline):
+        return next((f for f in self._all() if timeline.pool_item in f.clips), None)
 
     def ImportMedia(self, paths):
         out = []
@@ -227,6 +299,16 @@ class MediaPool:
                 return []
             if pool in self.resolve.refuse:
                 return []
+            if info.get("recordFrame") is not None:  # a place already taken is refused
+                track = int(info.get("trackIndex", 1))
+                kinds = {1: ["video"], 2: ["audio"]}.get(info.get("mediaType"), ["video", "audio"])
+                fps = pool.fps if pool.video else timeline.fps
+                start = int(info["recordFrame"])
+                end = start + int(round((info["endFrame"] - info["startFrame"]) * timeline.fps / fps))
+                for kind in kinds:
+                    row = timeline.tracks[kind][track - 1] if track <= len(timeline.tracks[kind]) else []
+                    if any(i.start < end and i.end > start for i in row):
+                        return []
         added = []
         for info in infos:
             pool = info["mediaPoolItem"]
@@ -253,6 +335,9 @@ class MediaPool:
         for t in timelines:
             if t in self.project.timelines:
                 self.project.timelines.remove(t)
+                for f in self._all():
+                    if t.pool_item in f.clips:
+                        f.clips.remove(t.pool_item)
         return True
 
     def DeleteClips(self, clips):
@@ -331,6 +416,7 @@ class Resolve:
         self.closed = False
         self.refuse: set = set()  # pool items whose pieces are refused
         self.lut_by_graph = False  # newer Resolve: SetLUT only through the node graph
+        self.no_copy_grades = False  # if Resolve will not copy grades from the backup
         self.lock_rate = False
         self.append_calls = 0
 

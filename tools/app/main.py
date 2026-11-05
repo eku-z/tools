@@ -1,5 +1,6 @@
 """Start Tools: py -3.12 -m tools (--startup-time prints how long the
-window took to appear, then quits)."""
+window took to appear, then quits; --check says what Tools finds on this
+computer)."""
 
 from __future__ import annotations
 
@@ -11,6 +12,10 @@ STARTED = time.perf_counter()
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if "--check" in argv:
+        from tools.app import check
+
+        return check.main()
     if sys.platform == "win32":
         try:  # its own taskbar button and icon, not Python's
             import ctypes
